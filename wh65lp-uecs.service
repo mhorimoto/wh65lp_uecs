@@ -1,0 +1,33 @@
+[Unit]
+Description=WH65LP weather sensor -> UECS CCM broadcaster
+Documentation=file:///usr/local/etc/uecsgw/config.ini
+# recvdata.service と同じLAN(16520/udp)を使うだけで直接の依存関係は無いが、
+# 起動順序をわかりやすくするため一応after指定しておく(必須ではない)
+After=network-online.target recvdata.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- 環境に合わせて要調整 ---
+# 実際にscriptを置いた場所・pythonのパスに書き換えること
+# (`which python3` `which wh65lp_parser.py` 等で確認)
+ExecStart=/usr/bin/python3 /usr/local/bin/wh65lp_parser.py --broadcast
+
+# シリアルポート(/dev/ttyUSB*, /dev/serial/by-id/...)へのアクセスが必要なため、
+# rootで動かさない場合は dialout グループに所属したユーザーで実行すること。
+# recvdata.serviceと同じユーザーで揃えたい場合はここを合わせて書き換える。
+User=root
+Group=dialout
+
+# 異常終了時は自動再起動する(シリアル抜き差し・一時的なエラーからの復帰用)
+Restart=on-failure
+RestartSec=5
+
+# systemdのjournalへ出力を集約する(syslog経由のログと合わせてjournalctlで見える)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wh65lp_parser.py
+
+[Install]
+WantedBy=multi-user.target
