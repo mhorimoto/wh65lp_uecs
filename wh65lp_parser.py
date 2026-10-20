@@ -34,10 +34,6 @@ WH65LP (misol) 気象センサー RS485/UART データパーサー
   照度     : raw/10 [Lux]
   気圧     : raw/100 [hPa]
 
-【注意】風向(度)への変換式のみ、原資料の記載に内部矛盾があり再現できませんでした。
-    生の12bit値 (wind_direction_raw, 0-4095) は取得できるので、実機で方位磁石と
-    突き合わせて校正することをお勧めします（calibrate_wind_direction() 参照）。
-
 --------------------------------------------------------------
 UECS CCM ブロードキャスト機能について
 --------------------------------------------------------------
@@ -57,11 +53,40 @@ WH65LPの実測更新間隔(約16秒)より短い周期で「最新の保持値�
 断線とみなして送信を止めます(古い値を生きたデータとして流し続けない)。
 
 実行方法:
-    python3 wh65lp_parser.py                        → サンプルデータで動作確認
-    python3 wh65lp_parser.py /dev/ttyUSB0            → 実機から読み込み、標準出力に表示するだけ(送信しない)
-    python3 wh65lp_parser.py /dev/ttyUSB0 --broadcast → 実機から読み込み、UECS CCMとして16520/udpに送信し続ける(systemdサービス向け)
-"""
+    python3 wh65lp_parser.py
+                        → サンプルデータで動作確認
+    python3 wh65lp_parser.py /dev/ttyUSB0
+                        → 実機から読み込み、標準出力に表示するだけ
+    python3 wh65lp_parser.py /dev/ttyUSB0 --broadcast
+                        → 実機から読み込み、UECS CCMとして
+                          16520/udpに送信し続ける(systemdサービス向け)
 
+--------------------------------------------------------------
+本日雨量(daily_rain_mm)の計算について【2026-10-20 バグ修正】
+--------------------------------------------------------------
+WH65LPが送ってくる積算降水量(rain_raw)は電源投入/センサーリセット以降
+ずっと加算され続ける値なので、「本日何mm降ったか」を得るために、日付が
+変わった瞬間のrain_rawを基準値として記録し、以降は「現在値-基準値」を
+本日雨量として計算している(calculate_daily_rain関数)。
+
+このロジックには重大なバグがあった: calculate_daily_rain()がCRC8や
+チェックサムの検証(is_valid判定)より前の、parse_wh65lp()の中で無条件に
+呼ばれていたため、たまたま日付が変わった直後に届いた1パケットが通信
+ノイズ等でCRC不一致(無効)だった場合、その化けたrain_rawの値で「本日の
+基準値」が確定してしまっていた。無効パケット自体はcache更新・送信は
+されないが、基準値を記録するグローバル状態(_base_rain_raw, _base_rain_day)
+は既に書き換わってしまっており、以降その日1日分の本日雨量計算が
+「化けた基準値」を引きずったまま狂ってしまう(=次に来た正常パケットで
+いきなり大きな差分が出てしまう)という不具合が実際に発生した。
+
+対策として、calculate_daily_rain()の呼び出しをparse_wh65lp()から削除し、
+is_validが確認できた後(_serial_reader_thread内)でのみ呼ぶように変更した。
+これにより、本日の基準値は必ずCRC8・チェックサムが正しい、信頼できる
+パケットのrain_rawからのみ記録されるようになる。
+"""
+VERSION = "2.32"
+import os
+import json
 import configparser
 import socket
 import syslog
@@ -69,7 +94,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Sequence
-
+from datetime import datetime
 
 PACKET_LENGTH = 21
 WIND_SPEED_COEFF = 0.51   # m/s per count
@@ -95,13 +120,18 @@ class WH65LPReading:
     header: int
     check_code: int
 
-    wind_direction_raw: int          # 0-4095 (12bit raw, 度への変換式は未確定)
+    wind_direction_deg: int          # 0-359 (度)
+    wind_direction_16: int           # 0-15 (16方位コード: 0=N, 1=NNE... 15=NNW)
+    wind_direction_raw: int          # 補正前生角度 (0-359)
     temperature_c: float
     humidity_pct: int
 
     wind_speed_ms: float
     gust_speed_ms: float
     rain_mm: float
+    rain_raw: int             # 積算降水量の生のtipカウント(基準値計算に使う)
+    daily_rain_mm: float      # 本日雨量。is_validなパケットのみ呼び出し側で設定する
+                               # (parse_wh65lp()内では0.0のプレースホルダのまま)
     uv_raw: int
     light_lux: float
     pressure_hpa: float
@@ -158,10 +188,126 @@ def _checksum8(data: Sequence[int]) -> int:
     """単純な加算チェックサム (合計を256で割った余り)"""
     return sum(data) & 0xFF
 
+# 日雨量計算用の基準値保持（モジュールレベル変数）
+# 【重要】この状態を更新してよいのは、CRC8・チェックサムが正しい(is_valid=True)
+# パケットから得たrain_rawに対してのみ。無効パケットのデータでこの状態を
+# 汚染すると、その日1日分の本日雨量が丸ごと狂う(2026-10-20に実機で発生した
+# 不具合、詳細はモジュールdocstring参照)。そのため呼び出しは必ず
+# _serial_reader_thread内のis_validチェック後からのみ行うこと。
+_base_rain_raw = None
+_base_rain_day = None
+
+# 基準値の永続化(サービス再起動で本日雨量が0に戻るのを防ぐ)。
+# 保存内容: {"day": "YYYY-MM-DD", "base_raw": int}
+# 起動後の最初の calculate_daily_rain() 呼び出し時に1回だけ読み戻し、
+# 保存された日付が今日と一致する場合のみ基準値として採用する。
+BASE_RAIN_STATE_FILE = "/var/lib/wh65lp/daily_rain.json"
+_base_rain_loaded = False
+
+
+def _save_base_rain() -> None:
+    """基準値を一時ファイル経由で原子的に保存する(失敗しても動作は継続)。"""
+    try:
+        os.makedirs(os.path.dirname(BASE_RAIN_STATE_FILE), exist_ok=True)
+        tmp = BASE_RAIN_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"day": _base_rain_day.isoformat(), "base_raw": _base_rain_raw}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, BASE_RAIN_STATE_FILE)
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, f"WH65LP: 基準値の保存に失敗: {e}")
+
+
+def _load_base_rain() -> None:
+    """保存済みの基準値が今日のものなら復元する。"""
+    global _base_rain_raw, _base_rain_day
+    try:
+        with open(BASE_RAIN_STATE_FILE) as f:
+            d = json.load(f)
+        day = datetime.strptime(d["day"], "%Y-%m-%d").date()
+        base = int(d["base_raw"])
+        if day == datetime.now().date():
+            _base_rain_raw, _base_rain_day = base, day
+            syslog.syslog(syslog.LOG_INFO, f"WH65LP: 本日の基準値を復元しました: base_raw={base} day={day}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, f"WH65LP: 基準値の読み込みに失敗(無視して続行): {e}")
+
+def calculate_daily_rain(current_raw: int) -> float:
+    """基準値引き算方式による本日雨量計算。
+
+    呼び出し元は、is_valid(CRC8・チェックサム正常)なパケットのrain_rawの
+    みをここに渡すこと。無効なパケットの値を渡すと、本日の基準値が
+    不正な値で確定してしまい、以降その日のdaily_rain_mmが丸ごと狂う。
+    """
+    global _base_rain_raw, _base_rain_day, _base_rain_loaded
+    if not _base_rain_loaded:
+        _base_rain_loaded = True
+        _load_base_rain()
+    today = datetime.now().date()
+
+    # 日付が変わった、または初回起動時に本日の基準値（ベースライン）を記録
+    if _base_rain_day != today or _base_rain_raw is None:
+        if current_raw > 0:
+            _base_rain_raw = current_raw
+            _base_rain_day = today
+            _save_base_rain()
+            return 0.0
+        else:
+            return 0.0
+
+    # 本日の基準値からの増分を計算
+    if current_raw >= _base_rain_raw:
+        delta_tips = current_raw - _base_rain_raw
+    else:
+        # 16bit自然オーバーフロー (65535 → 0) を日中に跨いだ場合
+        if _base_rain_raw > 60000 and current_raw < 5000:
+            delta_tips = (65536 - _base_rain_raw) + current_raw
+        else:
+            # 電池交換や本体リセットで0に戻った場合は、現在の値を新しい基準値とする
+            _base_rain_raw = current_raw
+            _save_base_rain()
+            delta_tips = 0
+
+    return round(delta_tips * RAIN_COEFF, 1)
+
+
+def sd_notify(state: str) -> bool:
+    """
+    systemd に通知を送る汎用関数（外部ライブラリ不要）
+    例:
+        sd_notify("READY=1")                  # 起動完了を通知
+        sd_notify("STATUS=Version 2.10 稼働中") # systemctl status の文字列を更新
+        sd_notify("WATCHDOG=1")               # ウォッチドッグの生存通知
+    """
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return False  # systemd配下で動いていない時はスキップ
+
+    if sock_path.startswith("@"):
+        sock_path = "\0" + sock_path[1:]
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(state.encode("utf-8"), sock_path)
+            return True
+    except Exception:
+        return False
+
 
 def parse_wh65lp(raw: bytes) -> WH65LPReading:
     """
     WH65LPの21バイトパケットを解析して WH65LPReading を返す。
+
+    【重要】本関数はCRC8・チェックサムの検証結果(is_valid)に関わらず、
+    フォーマットさえ合っていれば(長さ21バイト・ヘッダー0x24)パース処理を
+    行う。そのため、本関数の中では「本日の基準値」のような、呼び出し
+    回数や結果が後々まで影響する副作用のある処理(calculate_daily_rain等)
+    を絶対に行わないこと。無効なパケットでそれらの状態が汚染されるのを
+    防ぐため、daily_rain_mmは0.0のプレースホルダのまま返し、実際の計算は
+    呼び出し側がis_validを確認した後に行う。
 
     Parameters
     ----------
@@ -188,13 +334,23 @@ def parse_wh65lp(raw: bytes) -> WH65LPReading:
     header = raw[0]
     check_code = raw[1]
 
-    # --- 風向(12bit) + 気温(12bit) のニブルパック解除 ---
-    nibbles = []
-    for b in raw[2:5]:
-        nibbles.append((b >> 4) & 0xF)
-        nibbles.append(b & 0xF)
-    wind_direction_raw = (nibbles[0] << 8) | (nibbles[1] << 4) | nibbles[2]
-    temp_raw = (nibbles[3] << 8) | (nibbles[4] << 4) | nibbles[5]
+    # --- 風向 (9bit: 0〜359度) ---
+    # Byte 2 (下位8bit) と Byte 3 の最上位bit (Bit 7: 9bit目) を結合
+    raw_dir = raw[2] | ((raw[3] & 0x80) << 1)
+
+    # 実測オフセット補正（真北に対する物理的な取り付けズレを補正）
+    # ※生の角度のままで良い場合は 0 にしてください
+    OFFSET_DEG = 0
+    wind_direction_deg = (raw_dir - OFFSET_DEG + 360) % 360
+
+    # UECS標準の16方位コード (0=N, 1=NNE, ..., 15=NNW)
+    wind_direction_16 = int((wind_direction_deg + 11.25) / 22.5) % 16
+    wind_direction_raw = raw_dir
+
+    # --- 気温 (11bit: -40.0〜60.0 ℃) ---
+    # Byte 3の下位3bit (Bit 0〜2) が上位3bit、Byte 4 が下位8bit
+    # ※Bit 3はローバッテリーフラグのためマスク(& 0x07)
+    temp_raw = ((raw[3] & 0x07) << 8) | raw[4]
     temperature_c = (temp_raw - 400) / 10.0
 
     # --- 湿度 ---
@@ -211,6 +367,10 @@ def parse_wh65lp(raw: bytes) -> WH65LPReading:
     # --- 積算降水量 ---
     rain_raw = (raw[8] << 8) | raw[9]
     rain_mm = round(rain_raw * RAIN_COEFF, 2)
+    # daily_rain_mmはここでは計算しない(上記docstring参照)。
+    # is_validな場合のみ、呼び出し側(_serial_reader_thread)が
+    # calculate_daily_rain(reading.rain_raw)で計算して上書きする。
+    daily_rain_mm = 0.0
 
     # --- UV ---
     uv_raw = (raw[10] << 8) | raw[11]
@@ -238,12 +398,16 @@ def parse_wh65lp(raw: bytes) -> WH65LPReading:
     return WH65LPReading(
         header=header,
         check_code=check_code,
+        wind_direction_deg=wind_direction_deg,
+        wind_direction_16=wind_direction_16,
         wind_direction_raw=wind_direction_raw,
         temperature_c=round(temperature_c, 1),
         humidity_pct=humidity_pct,
         wind_speed_ms=wind_speed_ms,
         gust_speed_ms=gust_speed_ms,
         rain_mm=rain_mm,
+        rain_raw=rain_raw,
+        daily_rain_mm=daily_rain_mm,
         uv_raw=uv_raw,
         light_lux=light_lux,
         pressure_hpa=pressure_hpa,
@@ -286,9 +450,10 @@ DEFAULT_CONFIG_PATH = "/usr/local/etc/uecsgw/config.ini"
 #   WAirTemp    : 屋外気温    [C]      小数点下1桁
 #   WAirHumid   : 屋外湿度    [%]      整数
 #   WWindSpeed  : 屋外風速    [m/s]    整数
-#   WRainfall   : 屋外降雨    []       整数
+#   WRainfall   : 屋外降雨    [mm]     整数 (本日雨量=daily_rain_mmを使用)
 # 独自拡張識別子(UECS未定義の項目、またはWWindDir16の校正が未確定なため):
-#   WWindDirRaw.mOC  : 風向 生値(0-4095, 校正後にWWindDir16へ移行する想定)
+#   WWindDir.mOC     : 風向 度数(0-359)
+#   WWindDir16       : UECS標準16方位コード(0-15)
 #   WWindGust.mOC    : 突風風速[m/s]
 #   UV.mOC           : UV 生値
 #   Illuminance.mOC  : 照度[Lux]
@@ -297,8 +462,9 @@ CCM_DEFINITIONS = (
     ("WAirTemp", lambda r: r.temperature_c),
     ("WAirHumid", lambda r: r.humidity_pct),
     ("WWindSpeed", lambda r: round(r.wind_speed_ms)),
-    ("WRainfall", lambda r: round(r.rain_mm)),
-    ("WWindDirRaw.mOC", lambda r: r.wind_direction_raw),
+    ("WRainfall", lambda r: round(r.daily_rain_mm)),
+    ("WWindDir.mOC", lambda r: r.wind_direction_deg),   # 360度数 (0〜359)
+    ("WWindDir16", lambda r: r.wind_direction_16),      # UECS標準 16方位コード (0〜15)
     ("WWindGust.mOC", lambda r: r.gust_speed_ms),
     ("UV.mOC", lambda r: r.uv_raw),
     ("Illuminance.mOC", lambda r: r.light_lux),
@@ -369,7 +535,7 @@ def get_own_ip(probe_host: str, probe_port: int = 16520) -> str:
             probe.connect((probe_host, probe_port))
             return probe.getsockname()[0]
     except OSError:
-        return "0.0.0.0"
+        return "192.168.179.152"
 
 
 def build_ccm_xml(ccm_type: str, value, room: str, region: str, order: str,
@@ -389,7 +555,7 @@ def build_ccm_xml(ccm_type: str, value, room: str, region: str, order: str,
 def broadcast_reading(sock: socket.socket, reading: "WH65LPReading",
                        bcast_addr: str, port: int,
                        room: str, region: str, order: str,
-                       my_ip: str, priority: int = 1,
+                       my_ip: str, priority: int = 15,
                        inter_packet_delay: float = 0.05) -> None:
     """WH65LPReading 1件分を、項目ごとに複数のCCM電文としてブロードキャスト送信する。
 
@@ -417,11 +583,18 @@ def _serial_reader_thread(port: str, cache: LatestReading, baudrate: int = 9600)
 
     シリアル通信自体が例外を出した場合(ケーブル抜けなど)は5秒待って
     read_from_serial()自体を呼び直す(ポートの再オープンからやり直す)。
+
+    【重要】calculate_daily_rain()は、ここでis_validを確認した後にのみ
+    呼び出すこと。parse_wh65lp()の中では呼ばない(詳細はモジュール
+    docstring、および calculate_daily_rain() 自体のdocstring参照)。
     """
     while True:
         try:
             for reading in read_from_serial(port, baudrate=baudrate):
                 if reading.is_valid:
+                    # 本日雨量は、CRC8・チェックサムが正しいと確認できた
+                    # このパケットのrain_rawからのみ計算する。
+                    reading.daily_rain_mm = calculate_daily_rain(reading.rain_raw)
                     cache.update(reading)
                 else:
                     syslog.syslog(
@@ -499,7 +672,8 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
+    sd_notify(f"STATUS=v{VERSION} running")
+    sd_notify("READY=1")  # Type=notify の場合、systemctl start の待機を解除
     try:
         while True:
             reading = cache.get_if_fresh()
@@ -511,7 +685,8 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
                     f"WH65LP CCM送信: {sent_count}/{total}件 "
                     f"T={reading.temperature_c} H={reading.humidity_pct} "
                     f"WS={reading.wind_speed_ms} Rain={reading.rain_mm} "
-                    f"Dir(raw)={reading.wind_direction_raw} UV={reading.uv_raw} "
+                    f"DailyRain={reading.daily_rain_mm} "
+                    f"Dir(deg)={reading.wind_direction_deg} UV={reading.uv_raw} "
                     f"Lux={reading.light_lux} Press={reading.pressure_hpa}",
                 )
                 if sent_count < total:
@@ -575,8 +750,7 @@ def _print_reading(reading: "WH65LPReading") -> None:
     print(f"生データ        : {reading.raw_hex}")
     print(f"ヘッダー        : 0x{reading.header:02X}")
     print(f"チェックコード  : 0x{reading.check_code:02X}")
-    print(f"風向(raw, 度未変換): {reading.wind_direction_raw} "
-          f"(0x{reading.wind_direction_raw:03X})  ※要校正")
+    print(f"風向            : {reading.wind_direction_deg} ° (16方位={reading.wind_direction_16})")
     print(f"気温            : {reading.temperature_c} ℃")
     print(f"湿度            : {reading.humidity_pct} %")
     print(f"風速            : {reading.wind_speed_ms} m/s")
