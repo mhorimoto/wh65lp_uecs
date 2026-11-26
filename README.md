@@ -49,7 +49,7 @@
 | `idx 20` | 1 byte | チェックサム2 | idx 17-19 の 3 バイト加算和 mod 256 |
 
 > **注記（風向データについて）**:
-> 風向（度）への変換式は仕様書の記載に不整合があるため，現状は 12bit 生値（0-4095）を `WWindDirRaw.mOC` として送信します．運用環境に合わせて方位磁石等との実機校正を行ってください．
+> 風向は `WWindDir.mOC`（0–359°）および `WWindDir16`（UECS 標準 16 方位コード，0=N）として送信します．取り付け方向によっては `wh65lp_parser.py` 内の `OFFSET_DEG` を調整してください．
 
 ---
 
@@ -62,8 +62,10 @@
 | `WAirTemp` | 予約 | ℃（小数第1位） | `temperature_c` | 屋外気温 |
 | `WAirHumid` | 予約 | %（整数） | `humidity_pct` | 屋外湿度 |
 | `WWindSpeed` | 予約 | m/s（整数） | `round(wind_speed_ms)` | 屋外風速 |
-| `WRainfall` | 予約 | mm（整数） | `round(rain_mm)` | 屋外積算雨量 |
-| `WWindDirRaw.mOC` | 拡張 | raw (0-4095) | `wind_direction_raw` | 風向（生値・要校正） |
+| `WRainfall` | 予約 | mm（整数） | `round(daily_rain_mm)` | 本日雨量 |
+| `WRainAlert` | 拡張 | 0 / 1 | `rain_alert` | 降雨アラート（直近 `RainAlertTimeout` 秒以内に雨量増加があれば 1，なければ 0） |
+| `WWindDir.mOC` | 拡張 | 度（整数） | `wind_direction_deg` | 風向（0–359°） |
+| `WWindDir16` | 拡張 | 0–15（整数） | `wind_direction_16` | 風向（UECS 標準 16 方位コード，0=N） |
 | `WWindGust.mOC` | 拡張 | m/s（小数第2位） | `gust_speed_ms` | 突風風速 |
 | `UV.mOC` | 拡張 | raw | `uv_raw` | UV 生値 |
 | `Illuminance.mOC` | 拡張 | Lux（小数第1位） | `light_lux` | 照度 |
@@ -114,6 +116,8 @@ BroadcastAddr = 192.168.1.255
 SendInterval = 10
 # この秒数以上新しいデータが来ない場合はセンサ異常とみなして送信停止
 StaleAfter = 90
+# 降雨アラートのタイムアウト（秒）: 最後に雨量センサが増加してからこの時間が経過すると WRainAlert が 0 に戻る
+RainAlertTimeout = 900
 ```
 
 ## 使い方

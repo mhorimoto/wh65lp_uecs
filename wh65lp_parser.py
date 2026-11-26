@@ -84,7 +84,7 @@ is_validが確認できた後(_serial_reader_thread内)でのみ呼ぶように�
 これにより、本日の基準値は必ずCRC8・チェックサムが正しい、信頼できる
 パケットのrain_rawからのみ記録されるようになる。
 """
-VERSION = "2.32"
+VERSION = "2.41"
 import os
 import json
 import configparser
@@ -99,6 +99,7 @@ from datetime import datetime
 PACKET_LENGTH = 21
 WIND_SPEED_COEFF = 0.51   # m/s per count
 RAIN_COEFF = 0.254        # mm per count
+RAIN_ALERT_TIMEOUT = 900.0  # 降雨アラートのタイムアウト(秒) = 15分
 
 # チェックコード(idx1)について
 # 実機検証の結果、check_codeは全機種共通の固定値ではなく、個体ごとに
@@ -132,6 +133,8 @@ class WH65LPReading:
     rain_raw: int             # 積算降水量の生のtipカウント(基準値計算に使う)
     daily_rain_mm: float      # 本日雨量。is_validなパケットのみ呼び出し側で設定する
                                # (parse_wh65lp()内では0.0のプレースホルダのまま)
+    rain_alert: int           # 降雨アラート(0/1)。is_validなパケットのみ呼び出し側で設定する
+                               # (parse_wh65lp()内では0のプレースホルダのまま)
     uv_raw: int
     light_lux: float
     pressure_hpa: float
@@ -274,6 +277,38 @@ def calculate_daily_rain(current_raw: int) -> float:
     return round(delta_tips * RAIN_COEFF, 1)
 
 
+# 降雨アラート用の状態保持
+# rain_rawが直近RAIN_ALERT_TIMEOUT秒以内に増加していれば1、そうでなければ0。
+# calculate_daily_rainと同様、is_valid=Trueのパケットのrain_rawのみを渡すこと。
+_last_rain_raw_for_alert: Optional[int] = None
+_last_rain_increase_time: Optional[float] = None  # time.monotonic() 基準
+
+
+def calculate_rain_alert(current_raw: int, timeout: float = RAIN_ALERT_TIMEOUT) -> int:
+    """降雨アラート計算。rain_rawがtimeout秒以内に増加していれば1、そうでなければ0を返す。
+
+    is_validなパケットのrain_rawのみをここに渡すこと。
+    timeout は config.ini の [wh65lp] RainAlertTimeout(秒)で上書き可能。
+    """
+    global _last_rain_raw_for_alert, _last_rain_increase_time
+
+    if _last_rain_raw_for_alert is not None:
+        prev = _last_rain_raw_for_alert
+        if current_raw > prev:
+            # 通常の増加 → 雨が降っている
+            _last_rain_increase_time = time.monotonic()
+        elif prev > 60000 and current_raw < 5000:
+            # 16bitオーバーフロー(65535→0)をまたいだ増加 → 雨が降っている
+            _last_rain_increase_time = time.monotonic()
+        # else: 減少=センサリセット → アラートは更新しない
+
+    _last_rain_raw_for_alert = current_raw
+
+    if _last_rain_increase_time is None:
+        return 0
+    return 1 if time.monotonic() - _last_rain_increase_time <= timeout else 0
+
+
 def sd_notify(state: str) -> bool:
     """
     systemd に通知を送る汎用関数（外部ライブラリ不要）
@@ -367,10 +402,11 @@ def parse_wh65lp(raw: bytes) -> WH65LPReading:
     # --- 積算降水量 ---
     rain_raw = (raw[8] << 8) | raw[9]
     rain_mm = round(rain_raw * RAIN_COEFF, 2)
-    # daily_rain_mmはここでは計算しない(上記docstring参照)。
+    # daily_rain_mm / rain_alert はここでは計算しない(上記docstring参照)。
     # is_validな場合のみ、呼び出し側(_serial_reader_thread)が
-    # calculate_daily_rain(reading.rain_raw)で計算して上書きする。
+    # calculate_daily_rain()/calculate_rain_alert() で計算して上書きする。
     daily_rain_mm = 0.0
+    rain_alert = 0
 
     # --- UV ---
     uv_raw = (raw[10] << 8) | raw[11]
@@ -408,6 +444,7 @@ def parse_wh65lp(raw: bytes) -> WH65LPReading:
         rain_mm=rain_mm,
         rain_raw=rain_raw,
         daily_rain_mm=daily_rain_mm,
+        rain_alert=rain_alert,
         uv_raw=uv_raw,
         light_lux=light_lux,
         pressure_hpa=pressure_hpa,
@@ -458,11 +495,14 @@ DEFAULT_CONFIG_PATH = "/usr/local/etc/uecsgw/config.ini"
 #   UV.mOC           : UV 生値
 #   Illuminance.mOC  : 照度[Lux]
 #   AirPressure.mOC  : 気圧[hPa]
+#   WRainAlert       : 降雨アラート(0/1)
+#                      直近15分以内にrain_rawの増加が確認できた場合1、それ以外0
 CCM_DEFINITIONS = (
     ("WAirTemp", lambda r: r.temperature_c),
     ("WAirHumid", lambda r: r.humidity_pct),
     ("WWindSpeed", lambda r: round(r.wind_speed_ms)),
     ("WRainfall", lambda r: round(r.daily_rain_mm)),
+    ("WRainAlert", lambda r: r.rain_alert),             # 降雨アラート (0=降雨なし, 1=降雨中)
     ("WWindDir.mOC", lambda r: r.wind_direction_deg),   # 360度数 (0〜359)
     ("WWindDir16", lambda r: r.wind_direction_16),      # UECS標準 16方位コード (0〜15)
     ("WWindGust.mOC", lambda r: r.gust_speed_ms),
@@ -577,7 +617,8 @@ def broadcast_reading(sock: socket.socket, reading: "WH65LPReading",
     return sent_count
 
 
-def _serial_reader_thread(port: str, cache: LatestReading, baudrate: int = 9600) -> None:
+def _serial_reader_thread(port: str, cache: LatestReading, baudrate: int = 9600,
+                          rain_alert_timeout: float = RAIN_ALERT_TIMEOUT) -> None:
     """
     シリアルポートを読み続け、有効なパケットが来るたびcacheを更新するスレッド関数。
 
@@ -592,9 +633,10 @@ def _serial_reader_thread(port: str, cache: LatestReading, baudrate: int = 9600)
         try:
             for reading in read_from_serial(port, baudrate=baudrate):
                 if reading.is_valid:
-                    # 本日雨量は、CRC8・チェックサムが正しいと確認できた
+                    # 本日雨量・降雨アラートは、CRC8・チェックサムが正しいと確認できた
                     # このパケットのrain_rawからのみ計算する。
                     reading.daily_rain_mm = calculate_daily_rain(reading.rain_raw)
+                    reading.rain_alert = calculate_rain_alert(reading.rain_raw, rain_alert_timeout)
                     cache.update(reading)
                 else:
                     syslog.syslog(
@@ -634,6 +676,8 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
     # WH65LPの実測周期(約16秒)より十分長く、UECS A-10S-0の受信有効期間(30秒)より
     # 長い値をデフォルトにしておく(=多少の取りこぼしでは送信を止めない)
     stale_after = float(wh65_sec.get("StaleAfter", "90"))
+    # 降雨アラートのタイムアウト(秒): 最後にrain_rawが増加してからこの時間が経過すると0に戻る
+    rain_alert_timeout = float(wh65_sec.get("RainAlertTimeout", str(RAIN_ALERT_TIMEOUT)))
 
     # --- シリアルポートの決定: CLI引数 > config.ini、食い違いは警告 ---
     config_serial_port = wh65_sec.get("SerialPort") if wh65_sec else None
@@ -658,7 +702,8 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
         syslog.LOG_INFO,
         f"WH65LP UECS broadcaster START: serial={serial_port} "
         f"bcast={bcast_addr}:{port} room={room} region={region} order={order} "
-        f"myip={my_ip} interval={send_interval}s stale_after={stale_after}s",
+        f"myip={my_ip} interval={send_interval}s stale_after={stale_after}s "
+        f"rain_alert_timeout={rain_alert_timeout}s",
     )
     print(f"UECS CCMブロードキャスト開始: {bcast_addr}:{port} (自IP={my_ip}, "
           f"room={room} region={region} order={order}, {send_interval}秒毎)")
@@ -666,7 +711,9 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
     cache = LatestReading(stale_after=stale_after)
 
     reader = threading.Thread(
-        target=_serial_reader_thread, args=(serial_port, cache, baudrate), daemon=True
+        target=_serial_reader_thread,
+        args=(serial_port, cache, baudrate, rain_alert_timeout),
+        daemon=True,
     )
     reader.start()
 
@@ -685,7 +732,7 @@ def run_uecs_broadcast_daemon(serial_port: Optional[str], config_path: str = DEF
                     f"WH65LP CCM送信: {sent_count}/{total}件 "
                     f"T={reading.temperature_c} H={reading.humidity_pct} "
                     f"WS={reading.wind_speed_ms} Rain={reading.rain_mm} "
-                    f"DailyRain={reading.daily_rain_mm} "
+                    f"DailyRain={reading.daily_rain_mm} RainAlert={reading.rain_alert} "
                     f"Dir(deg)={reading.wind_direction_deg} UV={reading.uv_raw} "
                     f"Lux={reading.light_lux} Press={reading.pressure_hpa}",
                 )
@@ -756,6 +803,7 @@ def _print_reading(reading: "WH65LPReading") -> None:
     print(f"風速            : {reading.wind_speed_ms} m/s")
     print(f"突風            : {reading.gust_speed_ms} m/s")
     print(f"積算降水量      : {reading.rain_mm} mm")
+    print(f"降雨アラート    : {reading.rain_alert}")
     print(f"UV(raw)         : {reading.uv_raw}")
     print(f"照度            : {reading.light_lux} Lux")
     print(f"気圧            : {reading.pressure_hpa} hPa")
